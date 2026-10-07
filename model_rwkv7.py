@@ -165,7 +165,8 @@ class RWKV7Block(nn.Module):
         self.ln_1 = nn.LayerNorm(d_model)
         self.tmix = RWKV7TimeMix(d_model, n_head, lora_dim)
         self.ln_2 = nn.LayerNorm(d_model)
-        self.ffn = RWKV7ChannelMix(d_model, d_model * 4)
+        # 6x розширення для ChannelMix, щоб кількість параметрів дорівнювала SwiGLU (4x)
+        self.ffn = RWKV7ChannelMix(d_model, d_model * 6)
 
     def forward(self, x):
         x = x + self.tmix(self.ln_1(x))
