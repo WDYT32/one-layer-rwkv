@@ -377,7 +377,7 @@ def train():
         name = f"transformer-{args.pos}-L{args.n_layer}-f{args.fillers}-s{args.seed}{args.tag}"
     else:
         model = RWKV7Model(vocab.vocab_size, args.d_model, args.n_head, args.n_layer).to(device)
-        name = f"rwkv7-L{args.n_layer}-f{args.fillers}-s{args.seed}{args.tag}"
+        name = f"rwkv-channelmixing-L{args.n_layer}-f{args.fillers}-s{args.seed}{args.tag}"
 
     n_params = count_parameters(model)
     print(f"Run: {name}\nParameters: {n_params:,}")

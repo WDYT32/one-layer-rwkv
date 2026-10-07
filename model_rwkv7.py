@@ -137,13 +137,37 @@ class RWKV7TimeMix(nn.Module):
         return self.output(y.to(x.dtype) * g)
 
 
+class RWKV7ChannelMix(nn.Module):
+    def __init__(self, d_model, hidden_dim):
+        super().__init__()
+        self.time_shift = nn.ZeroPad2d((0, 0, 1, -1))
+        
+        self.time_maa_k = nn.Parameter(torch.full((1, 1, d_model), 0.5))
+        self.time_maa_r = nn.Parameter(torch.full((1, 1, d_model), 0.5))
+        
+        self.key = nn.Linear(d_model, hidden_dim, bias=False)
+        self.receptance = nn.Linear(d_model, d_model, bias=False)
+        self.value = nn.Linear(hidden_dim, d_model, bias=False)
+
+    def forward(self, x):
+        xx = self.time_shift(x)
+        xk = x * self.time_maa_k + xx * (1 - self.time_maa_k)
+        xr = x * self.time_maa_r + xx * (1 - self.time_maa_r)
+        
+        k = self.key(xk)
+        k = torch.relu(k) ** 2
+        kv = self.value(k)
+        
+        return torch.sigmoid(self.receptance(xr)) * kv
+
+
 class RWKV7Block(nn.Module):
     def __init__(self, d_model, n_head, lora_dim):
         super().__init__()
         self.ln_1 = nn.LayerNorm(d_model)
         self.tmix = RWKV7TimeMix(d_model, n_head, lora_dim)
         self.ln_2 = nn.LayerNorm(d_model)
-        self.ffn = SwiGLU(d_model, d_model * 4)  # same FFN as the transformer
+        self.ffn = RWKV7ChannelMix(d_model, d_model * 4)
 
     def forward(self, x):
         x = x + self.tmix(self.ln_1(x))
