@@ -17,10 +17,11 @@ DECAY_SCALE = 0.6065306597126334  # e^{-0.5}: decay w_t = exp(-DECAY_SCALE * sig
 class LoRA(nn.Module):
     """x -> up(act(down(x))), as used for w, a, g in RWKV-7."""
 
-    def __init__(self, d_model, rank, act='none', bias_init=None, up_init='zeros'):
+    def __init__(self, d_model, rank, act='none', bias_init=None, up_init='zeros', out_dim=None):
         super().__init__()
+        out_dim = d_model if out_dim is None else out_dim
         self.down = nn.Linear(d_model, rank, bias=False)
-        self.up = nn.Linear(rank, d_model, bias=bias_init is not None)
+        self.up = nn.Linear(rank, out_dim, bias=bias_init is not None)
         if up_init == 'zeros':
             nn.init.zeros_(self.up.weight)
         else:
@@ -55,28 +56,30 @@ class RWKV7TimeMix(nn.Module):
 
     def __init__(self, d_model, n_head, lora_dim=32):
         super().__init__()
-        assert d_model % n_head == 0
-        self.C, self.H, self.S = d_model, n_head, d_model // n_head
+        # Розширюємо внутрішню розмірність уваги вдвічі, щоб дати більше пам'яті (додає 4 * d_model^2 параметрів)
+        self.dim_att = d_model * 2
+        assert self.dim_att % n_head == 0
+        self.C, self.H, self.S = d_model, n_head, self.dim_att // n_head
 
-        # token-shift mixing coefficients
+        # token-shift mixing coefficients (застосовуються до входу x, тому залишаються d_model)
         for name in ('r', 'w', 'k', 'v', 'a', 'g'):
             setattr(self, f'mu_{name}', nn.Parameter(torch.full((d_model,), 0.5)))
 
-        self.receptance = nn.Linear(d_model, d_model, bias=False)
-        self.key = nn.Linear(d_model, d_model, bias=False)
-        self.value = nn.Linear(d_model, d_model, bias=False)
-        self.output = nn.Linear(d_model, d_model, bias=False)
+        self.receptance = nn.Linear(d_model, self.dim_att, bias=False)
+        self.key = nn.Linear(d_model, self.dim_att, bias=False)
+        self.value = nn.Linear(d_model, self.dim_att, bias=False)
+        self.output = nn.Linear(self.dim_att, d_model, bias=False)
 
         # spread initial decays: some channels remember long, some short
         w_bias = torch.linspace(-6.0, 1.0, self.S).repeat(n_head)
-        self.lora_w = LoRA(d_model, lora_dim, act='tanh', bias_init=w_bias)
-        self.lora_a = LoRA(d_model, lora_dim, act='none', bias_init=torch.zeros(d_model))
-        self.lora_g = LoRA(d_model, lora_dim, act='sigmoid', up_init='ortho')
+        self.lora_w = LoRA(d_model, lora_dim, act='tanh', bias_init=w_bias, out_dim=self.dim_att)
+        self.lora_a = LoRA(d_model, lora_dim, act='none', bias_init=torch.zeros(self.dim_att), out_dim=self.dim_att)
+        self.lora_g = LoRA(d_model, lora_dim, act='sigmoid', up_init='ortho', out_dim=self.dim_att)
 
-        self.k_k = nn.Parameter(torch.full((d_model,), 0.7))
-        self.k_a = nn.Parameter(torch.ones(d_model))
+        self.k_k = nn.Parameter(torch.full((self.dim_att,), 0.7))
+        self.k_a = nn.Parameter(torch.ones(self.dim_att))
         self.r_k = nn.Parameter(torch.zeros(n_head, self.S))
-        self.ln_x = nn.GroupNorm(n_head, d_model, eps=64e-5)
+        self.ln_x = nn.GroupNorm(n_head, self.dim_att, eps=64e-5)
 
     def forward(self, x):
         B, T, C = x.shape
@@ -133,7 +136,7 @@ class RWKV7TimeMix(nn.Module):
             y = torch.stack(outs, dim=1)                      # (B, T, H, S)
 
         bonus = (r * k * self.r_k).sum(-1, keepdim=True) * v  # (B, T, H, S)
-        y = self.ln_x(y.reshape(B * T, C)).view(B, T, C) + bonus.reshape(B, T, C)
+        y = self.ln_x(y.reshape(B * T, self.dim_att)).view(B, T, self.dim_att) + bonus.reshape(B, T, self.dim_att)
         return self.output(y.to(x.dtype) * g)
 
 
@@ -165,8 +168,8 @@ class RWKV7Block(nn.Module):
         self.ln_1 = nn.LayerNorm(d_model)
         self.tmix = RWKV7TimeMix(d_model, n_head, lora_dim)
         self.ln_2 = nn.LayerNorm(d_model)
-        # 6x розширення для ChannelMix, щоб кількість параметрів дорівнювала SwiGLU (4x)
-        self.ffn = RWKV7ChannelMix(d_model, d_model * 6)
+        # Повернули 4x розширення для ChannelMix (перенесли параметри в TimeMix)
+        self.ffn = RWKV7ChannelMix(d_model, d_model * 4)
 
     def forward(self, x):
         x = x + self.tmix(self.ln_1(x))
