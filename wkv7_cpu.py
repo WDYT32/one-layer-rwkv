@@ -29,10 +29,19 @@ def _load():
     try:
         from torch.utils.cpp_extension import load
         here = os.path.dirname(os.path.abspath(__file__))
-        flags = ['/O2'] if sys.platform == 'win32' else ['-O3', '-march=native']
+        # -fopenmp-simd lets the compiler vectorise the dot-product loops (needs no OpenMP runtime);
+        # if a compiler rejects a flag set, try the next, weaker one.
+        flag_sets = ([['/O2']] if sys.platform == 'win32' else
+                     [['-O3', '-march=native', '-fopenmp-simd'], ['-O3', '-march=native'], ['-O3']])
         print("[wkv7_cpu] compiling the CPU kernel (first use only, ~30-90 s)...", flush=True)
-        _ext = load(name='wkv7_cpu_ext', sources=[os.path.join(here, 'wkv7_cpu.cpp')],
-                    extra_include_paths=[here], extra_cflags=flags, verbose=False)
+        for i, flags in enumerate(flag_sets):
+            try:
+                _ext = load(name='wkv7_cpu_ext_v2', sources=[os.path.join(here, 'wkv7_cpu.cpp')],
+                            extra_include_paths=[here], extra_cflags=flags, verbose=False)
+                break
+            except Exception:
+                if i == len(flag_sets) - 1:
+                    raise
     except Exception as e:  # compiler / ninja missing, etc.
         _failed = True
         warnings.warn(f"wkv7_cpu: could not build the C++ kernel ({type(e).__name__}: {e}); "

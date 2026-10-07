@@ -27,6 +27,7 @@ void fwd_one(int Tn, int S, int64_t st,
             T sa = 0;
             if (Sp) {
                 const T* row = Sp + (int64_t)i * S;
+#pragma omp simd reduction(+ : sa)
                 for (int j = 0; j < S; ++j) sa += row[j] * at[j];
             }
             const T vi = vt[i];
@@ -34,12 +35,14 @@ void fwd_one(int Tn, int S, int64_t st,
             T* out = Sc + (int64_t)i * S;
             if (Sp) {
                 const T* row = Sp + (int64_t)i * S;
+#pragma omp simd reduction(+ : acc)
                 for (int j = 0; j < S; ++j) {
                     T s = row[j] * dt[j] + sa * bt[j] + vi * kt[j];
                     out[j] = s;
                     acc += s * rt[j];
                 }
             } else {
+#pragma omp simd reduction(+ : acc)
                 for (int j = 0; j < S; ++j) {
                     T s = vi * kt[j];
                     out[j] = s;
@@ -75,9 +78,13 @@ void bwd_one(int Tn, int S, int64_t st,
             const T* sc = Sc + (int64_t)i * S;
             const T* sp = Sp ? Sp + (int64_t)i * S : nullptr;
             T sa = 0;
-            if (sp) for (int j = 0; j < S; ++j) sa += sp[j] * at[j];
+            if (sp) {
+#pragma omp simd reduction(+ : sa)
+                for (int j = 0; j < S; ++j) sa += sp[j] * at[j];
+            }
             T dvv = 0, dsav = 0;
             const T vi = vt[i];
+#pragma omp simd reduction(+ : dvv, dsav)
             for (int j = 0; j < S; ++j) {
                 g[j] += dyi * rt[j];          // y_t = S_t r_t
                 drt[j] += sc[j] * dyi;

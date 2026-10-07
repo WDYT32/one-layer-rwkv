@@ -4,6 +4,16 @@ import torch.nn.functional as F
 
 from model_transformer import SwiGLU
 
+try:  # optional C++ CPU kernel (see wkv7_cpu.py); the PyTorch loop below is the fallback
+    from wkv7_cpu import wkv7_cpu, available as cpu_kernel_available
+except Exception:  # pragma: no cover
+    wkv7_cpu = None
+
+    def cpu_kernel_available():
+        return False
+
+USE_CPU_KERNEL = True  # set to False to force the reference PyTorch loop (used by test_wkv7_cpu.py)
+
 DECAY_SCALE = 0.6065306597126334  # e^{-0.5}: decay w_t = exp(-DECAY_SCALE * sigmoid(.)) in (0.545, 1)
 
 
@@ -43,7 +53,7 @@ class RWKV7TimeMix(nn.Module):
 
     Simplifications vs. the official implementation: no value-residual
     (v_first) across layers, simple init, and a naive Python loop over time
-    (fine for T <= ~64).
+    (fine for T <= ~64) unless the optional C++ CPU kernel in wkv7_cpu.py is available.
     """
 
     def __init__(self, d_model, n_head, lora_dim=32):
@@ -101,15 +111,18 @@ class RWKV7TimeMix(nn.Module):
         a_vec = -kk.float()                                  # "a" in the (r,w,k,v,a,b) notation
         b_vec = kk.float() * a.view(B, T, H, S).float()      # "b"
 
-        state = x.new_zeros(B, H, S, S, dtype=torch.float32)  # (V, K)
-        outs = []
-        for t in range(T):
-            sa = torch.einsum('bhvk,bhk->bhv', state, a_vec[:, t])
-            state = (state * decay[:, t].unsqueeze(-2)
-                     + sa.unsqueeze(-1) * b_vec[:, t].unsqueeze(-2)
-                     + v[:, t].unsqueeze(-1) * k[:, t].unsqueeze(-2))
-            outs.append(torch.einsum('bhvk,bhk->bhv', state, r[:, t]))
-        y = torch.stack(outs, dim=1)                          # (B, T, H, S)
+        if USE_CPU_KERNEL and x.device.type == 'cpu' and cpu_kernel_available():
+            y = wkv7_cpu(r, k, v, decay, a_vec, b_vec)        # (B, T, H, S); C++ kernel, own backward
+        else:
+            state = x.new_zeros(B, H, S, S, dtype=torch.float32)  # (V, K)
+            outs = []
+            for t in range(T):
+                sa = torch.einsum('bhvk,bhk->bhv', state, a_vec[:, t])
+                state = (state * decay[:, t].unsqueeze(-2)
+                         + sa.unsqueeze(-1) * b_vec[:, t].unsqueeze(-2)
+                         + v[:, t].unsqueeze(-1) * k[:, t].unsqueeze(-2))
+                outs.append(torch.einsum('bhvk,bhk->bhv', state, r[:, t]))
+            y = torch.stack(outs, dim=1)                      # (B, T, H, S)
 
         bonus = (r * k * self.r_k).sum(-1, keepdim=True) * v  # (B, T, H, S)
         y = self.ln_x(y.reshape(B * T, C)).view(B, T, C) + bonus.reshape(B, T, C)
