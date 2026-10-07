@@ -162,13 +162,12 @@ class RWKV7ChannelMix(nn.Module):
 
 
 class RWKV7Block(nn.Module):
-    def __init__(self, d_model, n_head, lora_dim, dim_att=None):
+    def __init__(self, d_model, n_head, lora_dim, dim_att=None, ffn_expand=4):
         super().__init__()
         self.ln_1 = nn.LayerNorm(d_model)
         self.tmix = RWKV7TimeMix(d_model, n_head, lora_dim, dim_att=dim_att)
         self.ln_2 = nn.LayerNorm(d_model)
-        # Повернули 4x розширення для ChannelMix (перенесли параметри в TimeMix)
-        self.ffn = RWKV7ChannelMix(d_model, d_model * 4)
+        self.ffn = RWKV7ChannelMix(d_model, d_model * ffn_expand)
 
     def forward(self, x):
         x = x + self.tmix(self.ln_1(x))
@@ -177,12 +176,12 @@ class RWKV7Block(nn.Module):
 
 
 class RWKV7Model(nn.Module):
-    def __init__(self, vocab_size, d_model=256, n_head=4, n_layer=1, lora_dim=32, dim_att=None):
+    def __init__(self, vocab_size, d_model=256, n_head=4, n_layer=1, lora_dim=32, dim_att=None, ffn_expand=4):
         super().__init__()
         self.token_emb = nn.Embedding(vocab_size, d_model)
         self.ln_0 = nn.LayerNorm(d_model)
         self.blocks = nn.ModuleList(
-            [RWKV7Block(d_model, n_head, lora_dim, dim_att=dim_att) for _ in range(n_layer)]
+            [RWKV7Block(d_model, n_head, lora_dim, dim_att=dim_att, ffn_expand=ffn_expand) for _ in range(n_layer)]
         )
         self.ln_f = nn.LayerNorm(d_model)
         self.head = nn.Linear(d_model, vocab_size, bias=False)
