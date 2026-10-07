@@ -142,23 +142,21 @@ class RWKV7ChannelMix(nn.Module):
         super().__init__()
         self.time_shift = nn.ZeroPad2d((0, 0, 1, -1))
         
-        self.time_maa_k = nn.Parameter(torch.full((1, 1, d_model), 0.5))
-        self.time_maa_r = nn.Parameter(torch.full((1, 1, d_model), 0.5))
+        # У RWKV-7 залишився лише один параметр зсуву (x_k)
+        self.x_k = nn.Parameter(torch.full((1, 1, d_model), 0.5))
         
         self.key = nn.Linear(d_model, hidden_dim, bias=False)
-        self.receptance = nn.Linear(d_model, d_model, bias=False)
         self.value = nn.Linear(hidden_dim, d_model, bias=False)
 
     def forward(self, x):
-        xx = self.time_shift(x)
-        xk = x * self.time_maa_k + xx * (1 - self.time_maa_k)
-        xr = x * self.time_maa_r + xx * (1 - self.time_maa_r)
+        # Зміщення послідовності на 1 крок у минуле мінус поточний стан
+        xx = self.time_shift(x) - x
         
-        k = self.key(xk)
-        k = torch.relu(k) ** 2
-        kv = self.value(k)
+        # Token Shift: x + (x_shifted - x) * x_k
+        k = x + xx * self.x_k
+        k = torch.relu(self.key(k)) ** 2
         
-        return torch.sigmoid(self.receptance(xr)) * kv
+        return self.value(k)
 
 
 class RWKV7Block(nn.Module):
