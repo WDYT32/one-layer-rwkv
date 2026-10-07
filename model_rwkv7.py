@@ -4,15 +4,12 @@ import torch.nn.functional as F
 
 from model_transformer import SwiGLU
 
-try:  # optional C++ CPU kernel (see wkv7_cpu.py); the PyTorch loop below is the fallback
-    from wkv7_cpu import wkv7_cpu, available as cpu_kernel_available
-except Exception:  # pragma: no cover
-    wkv7_cpu = None
+try:
+    from fla.ops.rwkv7 import chunk_rwkv7
+    HAS_FLA = True
+except ImportError:
+    HAS_FLA = False
 
-    def cpu_kernel_available():
-        return False
-
-USE_CPU_KERNEL = True  # set to False to force the reference PyTorch loop (used by test_wkv7_cpu.py)
 
 DECAY_SCALE = 0.6065306597126334  # e^{-0.5}: decay w_t = exp(-DECAY_SCALE * sigmoid(.)) in (0.545, 1)
 
@@ -97,7 +94,8 @@ class RWKV7TimeMix(nn.Module):
         r = self.receptance(xr)
         k = self.key(xk)
         v = self.value(xv)
-        decay = torch.exp(-DECAY_SCALE * torch.sigmoid(self.lora_w(xw)))
+        log_decay = -DECAY_SCALE * torch.sigmoid(self.lora_w(xw))
+        decay = torch.exp(log_decay)
         a = torch.sigmoid(self.lora_a(xa))
         g = self.lora_g(xg)
 
@@ -107,12 +105,22 @@ class RWKV7TimeMix(nn.Module):
         r = r.view(B, T, H, S).float()
         k = k.view(B, T, H, S).float()
         v = v.view(B, T, H, S).float()
+        log_decay = log_decay.view(B, T, H, S).float()
         decay = decay.view(B, T, H, S).float()
         a_vec = -kk.float()                                  # "a" in the (r,w,k,v,a,b) notation
         b_vec = kk.float() * a.view(B, T, H, S).float()      # "b"
 
-        if USE_CPU_KERNEL and x.device.type == 'cpu' and cpu_kernel_available():
-            y = wkv7_cpu(r, k, v, decay, a_vec, b_vec)        # (B, T, H, S); C++ kernel, own backward
+        if HAS_FLA and x.device.type == 'cuda':
+            # fla's chunk_rwkv7 expects bfloat16 or float16 for Triton kernels
+            y, _ = chunk_rwkv7(
+                r.bfloat16(),
+                k.bfloat16(),
+                v.bfloat16(),
+                a_vec.bfloat16(),
+                b_vec.bfloat16(),
+                log_w=log_decay.bfloat16()
+            )
+            y = y.float()
         else:
             state = x.new_zeros(B, H, S, S, dtype=torch.float32)  # (V, K)
             outs = []

@@ -2,3 +2,6 @@ runs/
 results/
 __pycache__/
 data/
+.ipynb
+.gitignore
+*.nix
