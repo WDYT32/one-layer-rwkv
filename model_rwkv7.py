@@ -54,10 +54,9 @@ class RWKV7TimeMix(nn.Module):
     (fine for T <= ~64) unless the optional C++ CPU kernel in wkv7_cpu.py is available.
     """
 
-    def __init__(self, d_model, n_head, lora_dim=32):
+    def __init__(self, d_model, n_head, lora_dim=32, dim_att=None):
         super().__init__()
-        # Розширюємо внутрішню розмірність уваги вдвічі, щоб дати більше пам'яті (додає 4 * d_model^2 параметрів)
-        self.dim_att = d_model * 2
+        self.dim_att = dim_att if dim_att is not None else d_model
         assert self.dim_att % n_head == 0
         self.C, self.H, self.S = d_model, n_head, self.dim_att // n_head
 
@@ -163,10 +162,10 @@ class RWKV7ChannelMix(nn.Module):
 
 
 class RWKV7Block(nn.Module):
-    def __init__(self, d_model, n_head, lora_dim):
+    def __init__(self, d_model, n_head, lora_dim, dim_att=None):
         super().__init__()
         self.ln_1 = nn.LayerNorm(d_model)
-        self.tmix = RWKV7TimeMix(d_model, n_head, lora_dim)
+        self.tmix = RWKV7TimeMix(d_model, n_head, lora_dim, dim_att=dim_att)
         self.ln_2 = nn.LayerNorm(d_model)
         # Повернули 4x розширення для ChannelMix (перенесли параметри в TimeMix)
         self.ffn = RWKV7ChannelMix(d_model, d_model * 4)
@@ -178,12 +177,12 @@ class RWKV7Block(nn.Module):
 
 
 class RWKV7Model(nn.Module):
-    def __init__(self, vocab_size, d_model=256, n_head=4, n_layer=1, lora_dim=32):
+    def __init__(self, vocab_size, d_model=256, n_head=4, n_layer=1, lora_dim=32, dim_att=None):
         super().__init__()
         self.token_emb = nn.Embedding(vocab_size, d_model)
         self.ln_0 = nn.LayerNorm(d_model)
         self.blocks = nn.ModuleList(
-            [RWKV7Block(d_model, n_head, lora_dim) for _ in range(n_layer)]
+            [RWKV7Block(d_model, n_head, lora_dim, dim_att=dim_att) for _ in range(n_layer)]
         )
         self.ln_f = nn.LayerNorm(d_model)
         self.head = nn.Linear(d_model, vocab_size, bias=False)
