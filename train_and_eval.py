@@ -137,26 +137,6 @@ def padded_fraction(batches, lengths):
     return real / max(padded, 1)
 
 
-def print_time_report(it_times):
-    """it_times: [(padded batch length, seconds since the previous iteration ended)].
-    With length bucketing the time per iteration SHOULD grow with length, so a spread
-    across bins is normal; a big gap between median and max inside one bin means stalls.
-    ms/position = median ms per iteration / mean padded length: roughly constant if time
-    is proportional to length, much larger for short batches if fixed overhead dominates."""
-    print("  time per iteration by padded length (data loading included):")
-    print("    length      n   median s     p95 s     max s   ms/position")
-    for lo, hi in [(0, 20), (21, 50), (51, 100), (101, 150), (151, 200), (201, 10 ** 9)]:
-        sel = [(L, t) for L, t in it_times if lo <= L <= hi]
-        if not sel:
-            continue
-        ts = sorted(t for _, t in sel)
-        mean_len = sum(L for L, _ in sel) / len(sel)
-        p95 = ts[min(len(ts) - 1, int(0.95 * len(ts)))]
-        hi_s = str(hi) if hi < 10 ** 9 else "+"
-        print(f"    {lo:3d}-{hi_s:<4s} {len(sel):6d} {statistics.median(ts):10.3f} {p95:9.3f} "
-              f"{ts[-1]:9.3f} {1000 * statistics.median(ts) / mean_len:12.1f}")
-
-
 def get_masks(batch, vocab):
     """Masks over targets = batch[:, 1:].
     Sequence layout: <expression> = <step 1> = <step 2> = ... = <answer> <eos>
@@ -421,7 +401,6 @@ def train():
         if train_sampler is not None:
             train_sampler.set_epoch(epoch)
         pbar = tqdm(train_loader, desc=f"Epoch {epoch + 1}/{args.epochs}")
-        it_times, t_prev = [], time.perf_counter()
         for batch, _ in pbar:
             batch = batch.to(device)
             inputs = batch[:, :-1]
@@ -437,14 +416,9 @@ def train():
             scheduler.step()
 
             pbar.set_postfix(loss=f"{loss.item():.4f}", T=batch.size(1))
-            now = time.perf_counter()
-            it_times.append((batch.size(1), now - t_prev))
-            t_prev = now
             writer.add_scalar('Loss/train', loss.item(), global_step)
             global_step += 1
 
-        if epoch == 0:
-            print_time_report(it_times)
         splits = {'id': evaluate(model, id_loader, vocab, device)}
         if ood_loader is not None:
             splits['ood'] = evaluate(model, ood_loader, vocab, device)

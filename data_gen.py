@@ -72,13 +72,13 @@ def find_redex(t):
 
 
 def solution_ops(tree):
-    """[(redex string, value string), ...] in evaluation order, e.g. ('5*2', '10').
+    """[(redex string, value string, op, l, r), ...] in evaluation order, e.g. ('5*2', '10', '*', 5, 2).
     The redex is rendered like the same subexpression inside the full expression,
     but without its own outer brackets (those disappear when it is evaluated)."""
     ops = []
     while isinstance(tree, tuple):
         op, l, r = find_redex(tree)
-        ops.append((render((op, l, r)), str(apply_op(op, l, r))))
+        ops.append((render((op, l, r)), str(apply_op(op, l, r)), op, l, r))
         tree = reduce_once(tree)
     return ops
 
@@ -99,7 +99,7 @@ def tokenize(s):
     return " ".join(s)
 
 
-FORMATS = ('trace', 'hybrid', 'compact')
+FORMATS = ('trace', 'hybrid', 'compact', 'hybrid_extended')
 
 
 def format_solution(steps, ops=None, fmt='trace'):
@@ -113,16 +113,74 @@ def format_solution(steps, ops=None, fmt='trace'):
             every step first names the operation it performs (R = the leftmost
             innermost operation, copied from the previous expression), then its value
             V, then rewrites the whole expression with V substituted ('; E_k').
+    hybrid_extended: like hybrid, but breaks down multi-digit multiplication into
+            partial products and sums them up.
     compact: 'E0 = R1 : V1 = R2 : V2 = ... = Rn : Vn <eos>'
             only the operations and their values, no rewritten expressions; the
             model has to track which values are still pending. The answer is Vn."""
     if fmt == 'trace':
         return " = ".join(tokenize(s) for s in steps) + " <eos>"
-    if fmt == 'hybrid':
-        segs = [f"{tokenize(r)} : {tokenize(v)} ; {tokenize(e)}"
-                for (r, v), e in zip(ops, steps[1:])]
+    if fmt in ('hybrid', 'hybrid_extended'):
+        segs = []
+        for op_tuple, e in zip(ops, steps[1:]):
+            r_str, v_str, op, l, r = op_tuple
+            if fmt == 'hybrid_extended' and op == '*' and (abs(l) >= 10 or abs(r) >= 10):
+                b_abs_str = str(abs(r))
+                sign_r = -1 if r < 0 else 1
+                a_abs_str = str(abs(l))
+                sign_l = -1 if l < 0 else 1
+                
+                macro_partials = []
+                sub_segs = []
+                for i, d_char in enumerate(reversed(b_abs_str)):
+                    if d_char == '0':
+                        continue
+                    part_r = int(d_char) * (10 ** i) * sign_r
+                    
+                    if abs(l) >= 10:
+                        micro_partials = []
+                        for j, l_char in enumerate(reversed(a_abs_str)):
+                            if l_char == '0':
+                                continue
+                            part_l = int(l_char) * (10 ** j) * sign_l
+                            val = part_l * part_r
+                            micro_partials.append(val)
+                            l_str = render(part_l, False)
+                            r_str_local = render(part_r, False)
+                            sub_segs.append(f"{tokenize(l_str)} * {tokenize(r_str_local)} : {tokenize(str(val))}")
+                        
+                        if len(micro_partials) > 1:
+                            accum = micro_partials[0]
+                            for val in micro_partials[1:]:
+                                next_accum = accum + val
+                                val_str = render(val, False)
+                                sub_segs.append(f"{tokenize(str(accum))} + {tokenize(val_str)} = {tokenize(str(next_accum))}")
+                                accum = next_accum
+                        macro_partials.append(l * part_r)
+                    else:
+                        val = l * part_r
+                        macro_partials.append(val)
+                        l_str = render(l, False)
+                        r_str_local = render(part_r, False)
+                        sub_segs.append(f"{tokenize(l_str)} * {tokenize(r_str_local)} : {tokenize(str(val))}")
+                
+                if len(sub_segs) > 1:
+                    res = f"{tokenize(r_str)} ="
+                    res += " " + " ; ".join(sub_segs)
+                    if len(macro_partials) > 1:
+                        accum = macro_partials[0]
+                        for val in macro_partials[1:]:
+                            next_accum = accum + val
+                            val_str = render(val, False)
+                            res += f" ; {tokenize(str(accum))} + {tokenize(val_str)} = {tokenize(str(next_accum))}"
+                            accum = next_accum
+                    segs.append(f"{res} ; {tokenize(e)}")
+                else:
+                    segs.append(f"{tokenize(r_str)} : {tokenize(v_str)} ; {tokenize(e)}")
+            else:
+                segs.append(f"{tokenize(r_str)} : {tokenize(v_str)} ; {tokenize(e)}")
     elif fmt == 'compact':
-        segs = [f"{tokenize(r)} : {tokenize(v)}" for r, v in ops]
+        segs = [f"{tokenize(r)} : {tokenize(v)}" for r, v, *_ in ops]
     else:
         raise ValueError(fmt)
     return " = ".join([tokenize(steps[0])] + segs) + " <eos>"
@@ -137,7 +195,8 @@ def generate_dataset(num_samples, levels, filepath, rng, max_abs, exclude=None, 
         steps = solution_steps(tree)
         assert len(steps) == level + 1 and steps[-1] == str(val)
         text = format_solution(steps, solution_ops(tree), fmt)
-        assert text.split().count('=') == level
+        if fmt != 'hybrid_extended':
+            assert text.split().count('=') == level
         data.append({"text": text, "level": level, "expr": expr_str,
                      "steps": steps, "answer": val})
         exprs.add(expr_str)
