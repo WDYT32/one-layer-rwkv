@@ -20,13 +20,15 @@ from model_rwkv7 import RWKV7Model
 class Vocab:
     def __init__(self):
         chars = ['0', '1', '2', '3', '4', '5', '6', '7', '8', '9',
-                 '+', '-', '*', '(', ')', '=', '_', '<eos>', '<pad>']
+                 '+', '-', '*', '(', ')', '=', '_', ':', ';', '<eos>', '<pad>']
         self.stoi = {ch: i for i, ch in enumerate(chars)}
         self.itos = {i: ch for i, ch in enumerate(chars)}
         self.pad_id = self.stoi['<pad>']
         self.eos_id = self.stoi['<eos>']
         self.eq_id = self.stoi['=']
         self.fill_id = self.stoi['_']
+        self.colon_id = self.stoi[':']   # hybrid/compact formats: 'redex : value'
+        self.semi_id = self.stoi[';']    # hybrid format: 'value ; rewritten expression'
         self.vocab_size = len(chars)
 
     def encode(self, string):
@@ -35,6 +37,13 @@ class Vocab:
 
     def decode(self, ids):
         return " ".join(self.itos[i] for i in ids)
+
+
+def answer_start(ids, vocab):
+    """Index where the final answer begins: just after the last '=', ':' or ';'
+    (trace: after the last '='; hybrid: after the last ';'; compact: after the last ':')."""
+    marks = {vocab.eq_id, vocab.colon_id, vocab.semi_id}
+    return max(i for i, t in enumerate(ids) if t in marks) + 1
 
 
 def apply_fillers(text, mode):
@@ -254,8 +263,7 @@ def generate_eval(model, dataset, vocab, device, max_len, n=1000, batch_size=128
     groups = defaultdict(list)  # prompt length -> [(prompt, gold_final, level)]
     for ids, level in items:
         first_eq = ids.index(vocab.eq_id)
-        last_eq = len(ids) - 1 - ids[::-1].index(vocab.eq_id)
-        gold_final = ids[last_eq + 1:-1]  # drop <eos>
+        gold_final = ids[answer_start(ids, vocab):-1]  # drop <eos>
         groups[first_eq + 1].append((ids[:first_eq + 1], gold_final, level))
 
     stats = defaultdict(lambda: {'n': 0, 'ok': 0, 'no_eos': 0})
@@ -278,8 +286,7 @@ def generate_eval(model, dataset, vocab, device, max_len, n=1000, batch_size=128
                     s['no_eos'] += 1
                     continue
                 row = row[:row.index(vocab.eos_id)]
-                last_eq = len(row) - 1 - row[::-1].index(vocab.eq_id)
-                s['ok'] += row[last_eq + 1:] == gold_final
+                s['ok'] += row[answer_start(row, vocab):] == gold_final
 
     n_total = sum(s['n'] for s in stats.values())
     return {

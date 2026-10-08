@@ -61,6 +61,28 @@ def solution_steps(tree):
     return steps
 
 
+def find_redex(t):
+    """The node reduce_once() would evaluate: leftmost innermost (op, num, num)."""
+    op, l, r = t
+    if isinstance(l, tuple):
+        return find_redex(l)
+    if isinstance(r, tuple):
+        return find_redex(r)
+    return t
+
+
+def solution_ops(tree):
+    """[(redex string, value string), ...] in evaluation order, e.g. ('5*2', '10').
+    The redex is rendered like the same subexpression inside the full expression,
+    but without its own outer brackets (those disappear when it is evaluated)."""
+    ops = []
+    while isinstance(tree, tuple):
+        op, l, r = find_redex(tree)
+        ops.append((render((op, l, r)), str(apply_op(op, l, r))))
+        tree = reduce_once(tree)
+    return ops
+
+
 def generate_expression(level, rng, max_abs, exclude=None):
     """level = number of operators. Level 1 has only 243 distinct expressions,
     so it is never excluded (that would loop forever)."""
@@ -77,13 +99,36 @@ def tokenize(s):
     return " ".join(s)
 
 
-def format_solution(steps):
-    """'( 3 + 4 ) * 2 = 7 * 2 = 14 <eos>': each '=' is followed by the expression
-    with one more operation evaluated; the last step is the answer itself."""
-    return " = ".join(tokenize(s) for s in steps) + " <eos>"
+FORMATS = ('trace', 'hybrid', 'compact')
 
 
-def generate_dataset(num_samples, levels, filepath, rng, max_abs, exclude=None):
+def format_solution(steps, ops=None, fmt='trace'):
+    """All formats have exactly `level` '=' tokens, and '=' only separates steps, so
+    the training script's step_acc (segments between '=') means the same everywhere.
+
+    trace   (default): 'E0 = E1 = E2 = ... = answer <eos>'
+            '( 3 + 4 ) * 2 = 7 * 2 = 14 <eos>': each '=' is followed by the expression
+            with one more operation evaluated; the last step is the answer itself.
+    hybrid : 'E0 = R1 : V1 ; E1 = R2 : V2 ; E2 = ... = Rn : Vn ; En <eos>'
+            every step first names the operation it performs (R = the leftmost
+            innermost operation, copied from the previous expression), then its value
+            V, then rewrites the whole expression with V substituted ('; E_k').
+    compact: 'E0 = R1 : V1 = R2 : V2 = ... = Rn : Vn <eos>'
+            only the operations and their values, no rewritten expressions; the
+            model has to track which values are still pending. The answer is Vn."""
+    if fmt == 'trace':
+        return " = ".join(tokenize(s) for s in steps) + " <eos>"
+    if fmt == 'hybrid':
+        segs = [f"{tokenize(r)} : {tokenize(v)} ; {tokenize(e)}"
+                for (r, v), e in zip(ops, steps[1:])]
+    elif fmt == 'compact':
+        segs = [f"{tokenize(r)} : {tokenize(v)}" for r, v in ops]
+    else:
+        raise ValueError(fmt)
+    return " = ".join([tokenize(steps[0])] + segs) + " <eos>"
+
+
+def generate_dataset(num_samples, levels, filepath, rng, max_abs, exclude=None, fmt='trace'):
     data, exprs, max_len = [], set(), 0
     answers = defaultdict(list)
     for _ in range(num_samples):
@@ -91,7 +136,8 @@ def generate_dataset(num_samples, levels, filepath, rng, max_abs, exclude=None):
         tree, expr_str, val = generate_expression(level, rng, max_abs, exclude)
         steps = solution_steps(tree)
         assert len(steps) == level + 1 and steps[-1] == str(val)
-        text = format_solution(steps)
+        text = format_solution(steps, solution_ops(tree), fmt)
+        assert text.split().count('=') == level
         data.append({"text": text, "level": level, "expr": expr_str,
                      "steps": steps, "answer": val})
         exprs.add(expr_str)
@@ -120,6 +166,8 @@ if __name__ == "__main__":
     parser.add_argument('--max_abs', type=int, default=999, help='bound on every intermediate value')
     parser.add_argument('--n_train', type=int, default=100000)
     parser.add_argument('--n_test', type=int, default=9000)
+    parser.add_argument('--format', type=str, default='trace', choices=FORMATS,
+                        help='solution layout, see format_solution(); use a separate --out_dir per format')
     args = parser.parse_args()
 
     train_max = args.train_max_ops or args.max_ops
@@ -130,16 +178,16 @@ if __name__ == "__main__":
 
     print(f"Generating train (1..{train_max} operators)...")
     train_exprs = generate_dataset(args.n_train, id_levels, f'{args.out_dir}/train.jsonl',
-                                   rng, args.max_abs)
+                                   rng, args.max_abs, fmt=args.format)
     print("Generating test_id (same levels, expressions unseen in train for >= 2 operators)...")
     generate_dataset(args.n_test, id_levels, f'{args.out_dir}/test_id.jsonl',
-                     rng, args.max_abs, exclude=train_exprs)
+                     rng, args.max_abs, exclude=train_exprs, fmt=args.format)
 
     ood_path = f'{args.out_dir}/test_ood.jsonl'
     if train_max < args.max_ops:
         ood_levels = list(range(train_max + 1, args.max_ops + 1))
         print(f"Generating test_ood ({ood_levels[0]}..{ood_levels[-1]} operators, longer than any train expression)...")
-        generate_dataset(args.n_test, ood_levels, ood_path, rng, args.max_abs)
+        generate_dataset(args.n_test, ood_levels, ood_path, rng, args.max_abs, fmt=args.format)
     elif os.path.exists(ood_path):
         os.remove(ood_path)  # stale file from an earlier split
     print("Done!")
