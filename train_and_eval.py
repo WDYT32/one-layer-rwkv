@@ -380,7 +380,7 @@ def train():
 
     if args.model == 'transformer':
         model = BaselineTransformer(vocab.vocab_size, args.d_model, args.n_head,
-                                    args.n_layer, pos=args.pos).to(device)
+                                    args.n_layer, pos=args.pos, max_len=args.max_len).to(device)
         name = f"transformer-{args.pos}-L{args.n_layer}-f{args.fillers}-s{args.seed}{args.tag}"
     elif args.model == 'rwkv-2x':
         # 1 шар, але з подвійними параметрами (через dim_att та ffn_expand=12) і вдвічі більшою кількістю голів
