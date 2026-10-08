@@ -190,7 +190,7 @@ def evaluate(model, loader, vocab, device):
                given the gold previous steps = per-operation reliability."""
     model.eval()
     ce_sum, tok_cnt, tok_ok = 0.0, 0, 0
-    stats = defaultdict(lambda: {'n': 0, 'em': 0, 'steps': 0, 'steps_ok': 0})
+    stats = defaultdict(lambda: {'n': 0, 'em': 0, 'steps': 0, 'steps_ok': 0, 'final_ans_ok': 0})
 
     for batch, levels in loader:
         batch, levels = batch.to(device), levels.to(device)
@@ -205,6 +205,21 @@ def evaluate(model, loader, vocab, device):
 
         ok = (hit | ~answer).all(dim=1)
         n_steps, n_ok = step_correctness(hit, batch, answer, vocab)
+        
+        final_ok_batch = torch.zeros(batch.size(0), dtype=torch.bool, device=batch.device)
+        for i in range(batch.size(0)):
+            row = batch[i].tolist()
+            try:
+                eos_idx = row.index(vocab.eos_id)
+            except ValueError:
+                eos_idx = len(row)
+            try:
+                ans_start = answer_start(row[:eos_idx], vocab)
+                if 0 < ans_start <= eos_idx:
+                    final_ok_batch[i] = hit[i, ans_start-1 : min(eos_idx, hit.size(1))].all()
+            except ValueError:
+                pass
+                
         for lvl in levels.unique().tolist():
             sel = levels == lvl
             s = stats[lvl]
@@ -212,6 +227,7 @@ def evaluate(model, loader, vocab, device):
             s['em'] += ok[sel].sum().item()
             s['steps'] += n_steps[sel].sum().item()
             s['steps_ok'] += n_ok[sel].sum().item()
+            s['final_ans_ok'] += final_ok_batch[sel].sum().item()
 
     n_total = sum(s['n'] for s in stats.values())
     steps_total = sum(s['steps'] for s in stats.values())
@@ -220,8 +236,10 @@ def evaluate(model, loader, vocab, device):
         'answer_token_acc': tok_ok / max(tok_cnt, 1),
         'em': sum(s['em'] for s in stats.values()) / max(n_total, 1),
         'step_acc': sum(s['steps_ok'] for s in stats.values()) / max(steps_total, 1),
+        'final_ans_acc': sum(s['final_ans_ok'] for s in stats.values()) / max(n_total, 1),
         'by_level': {int(l): {'n': s['n'], 'em': s['em'] / s['n'],
-                              'step_acc': s['steps_ok'] / max(s['steps'], 1)}
+                              'step_acc': s['steps_ok'] / max(s['steps'], 1),
+                              'final_ans_acc': s['final_ans_ok'] / s['n']}
                      for l, s in sorted(stats.items())},
     }
 
@@ -281,10 +299,12 @@ def generate_eval(model, dataset, vocab, device, max_len, n=1000, batch_size=128
 def fmt(name, m):
     lv = " ".join(f"L{l}:{v['em']:.3f}" for l, v in m['by_level'].items())
     st = " ".join(f"L{l}:{v['step_acc']:.3f}" for l, v in m['by_level'].items())
+    fa = " ".join(f"L{l}:{v['final_ans_acc']:.3f}" for l, v in m['by_level'].items())
     return (f"  {name:9s} loss={m['answer_loss']:.4f} tok_acc={m['answer_token_acc']:.4f} "
-            f"chain_EM={m['em']:.3f} step_acc={m['step_acc']:.4f}\n"
+            f"chain_EM={m['em']:.3f} step_acc={m['step_acc']:.4f} final_ans={m['final_ans_acc']:.4f}\n"
             f"            chain_EM by ops | {lv}\n"
-            f"            step_acc by ops | {st}")
+            f"            step_acc by ops | {st}\n"
+            f"           final_ans by ops | {fa}")
 
 
 def fmt_gen(name, g):
@@ -429,9 +449,11 @@ def train():
             writer.add_scalar(f'AnswerTokenAcc/{split}', m['answer_token_acc'], epoch)
             writer.add_scalar(f'EM/{split}', m['em'], epoch)
             writer.add_scalar(f'StepAcc/{split}', m['step_acc'], epoch)
+            writer.add_scalar(f'FinalAnsAcc/{split}', m['final_ans_acc'], epoch)
             for lvl, v in m['by_level'].items():
                 writer.add_scalar(f'EM_ops_{lvl}', v['em'], epoch)
                 writer.add_scalar(f'StepAcc_ops_{lvl}', v['step_acc'], epoch)
+                writer.add_scalar(f'FinalAnsAcc_ops_{lvl}', v['final_ans_acc'], epoch)
         entry = {'epoch': epoch + 1, **{f'test_{k}': v for k, v in splits.items()}}
 
         if args.gen_eval and epoch + 1 == args.epochs:
