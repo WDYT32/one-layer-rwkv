@@ -90,53 +90,6 @@ def make_collate(pad_id):
     return collate
 
 
-class LengthBucketSampler(Sampler):
-    """Batch sampler that puts sequences of similar length together, so padding
-    (and with it the time-recurrence length of RWKV) is no longer set by the one
-    longest example in a random batch of 64.
-    shuffle=True : shuffle, cut into pools of `pool_batches` batches, sort each pool
-                   by length, cut into batches, shuffle the batches (new order per epoch).
-    shuffle=False: one global sort by length (evaluation; order does not matter).
-    Side effect to keep in mind: batches become nearly single-level (length tracks the
-    number of operators), so gradient noise differs from fully random batches."""
-
-    def __init__(self, lengths, batch_size, shuffle=True, pool_batches=50, seed=0):
-        self.lengths, self.bs, self.shuffle, self.seed = lengths, batch_size, shuffle, seed
-        self.pool = pool_batches * batch_size if shuffle else max(len(lengths), 1)
-        self.epoch = 0
-
-    def set_epoch(self, epoch):
-        self.epoch = epoch
-
-    def __iter__(self):
-        rng = random.Random(self.seed * 100003 + self.epoch)
-        idx = list(range(len(self.lengths)))
-        if self.shuffle:
-            rng.shuffle(idx)
-        batches = []
-        for s in range(0, len(idx), self.pool):
-            pool = sorted(idx[s:s + self.pool], key=lambda i: self.lengths[i])
-            batches += [pool[i:i + self.bs] for i in range(0, len(pool), self.bs)]
-        if self.shuffle:
-            rng.shuffle(batches)
-        return iter(batches)
-
-    def __len__(self):
-        n, full = len(self.lengths), len(self.lengths) // self.pool
-        per_pool = -(-self.pool // self.bs)
-        return full * per_pool + -(-(n - full * self.pool) // self.bs)
-
-
-def padded_fraction(batches, lengths):
-    """Share of tokens in the padded batches that are real (1.0 = no padding)."""
-    real = padded = 0
-    for b in batches:
-        ls = [lengths[i] for i in b]
-        real += sum(ls)
-        padded += max(ls) * len(ls)
-    return real / max(padded, 1)
-
-
 def get_masks(batch, vocab):
     """Masks over targets = batch[:, 1:].
     Sequence layout: <expression> = <step 1> = <step 2> = ... = <answer> <eos>
@@ -341,8 +294,6 @@ def train():
                         help="filler variants for OLD filler-style data; no effect on solution-trace data")
     parser.add_argument('--threads', type=int, default=None,
                         help='torch.set_num_threads(n); default: PyTorch default (usually the physical cores)')
-    parser.add_argument('--no_bucket', action='store_true',
-                        help='disable length bucketing (random batches padded to their longest sequence)')
     parser.add_argument('--gen_eval', action='store_true',
                         help='after the last epoch also run free-running greedy generation and score '
                              'the final answer (slow: O(T^2) model calls, no cache)')
@@ -364,19 +315,15 @@ def train():
     train_ds = MathDataset(f'{args.data_dir}/train.jsonl', vocab, args.max_len, args.fillers)
     test_id_ds = MathDataset(f'{args.data_dir}/test_id.jsonl', vocab, args.max_len, args.fillers)
     def make_loader(ds, shuffle):
-        if args.no_bucket:
-            return DataLoader(ds, batch_size=args.batch_size, shuffle=shuffle, collate_fn=collate), None
-        lengths = [len(ids) for ids, _ in ds.items]
-        sampler = LengthBucketSampler(lengths, args.batch_size, shuffle, seed=args.seed)
-        return DataLoader(ds, batch_sampler=sampler, collate_fn=collate), sampler
+        return DataLoader(ds, batch_size=args.batch_size, shuffle=shuffle, collate_fn=collate)
 
-    train_loader, train_sampler = make_loader(train_ds, True)
-    id_loader, _ = make_loader(test_id_ds, False)
+    train_loader = make_loader(train_ds, True)
+    id_loader = make_loader(test_id_ds, False)
     ood_path = f'{args.data_dir}/test_ood.jsonl'
     ood_loader, test_ood_ds = None, None  # exists only if train covers fewer operators than the generator's max
     if os.path.exists(ood_path):
         test_ood_ds = MathDataset(ood_path, vocab, args.max_len, args.fillers)
-        ood_loader, _ = make_loader(test_ood_ds, False)
+        ood_loader = make_loader(test_ood_ds, False)
 
     if args.model == 'transformer':
         model = BaselineTransformer(vocab.vocab_size, args.d_model, args.n_head,
@@ -392,14 +339,7 @@ def train():
 
     n_params = count_parameters(model)
     print(f"Run: {name}\nParameters: {n_params:,}")
-    if train_sampler is not None:
-        lens = [len(ids) for ids, _ in train_ds.items]
-        rnd = random.Random(0)
-        shuf = list(range(len(lens)))
-        rnd.shuffle(shuf)
-        plain = [shuf[i:i + args.batch_size] for i in range(0, len(shuf), args.batch_size)]
-        print(f"Length bucketing: {padded_fraction(plain, lens):.0%} -> "
-              f"{padded_fraction(list(train_sampler), lens):.0%} of batch tokens are real (rest is padding)")
+
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=0.01)
     total_steps = args.epochs * len(train_loader)
@@ -418,8 +358,7 @@ def train():
 
     for epoch in range(args.epochs):
         model.train()
-        if train_sampler is not None:
-            train_sampler.set_epoch(epoch)
+
         pbar = tqdm(train_loader, desc=f"Epoch {epoch + 1}/{args.epochs}")
         for batch, _ in pbar:
             batch = batch.to(device)
