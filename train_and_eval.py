@@ -301,7 +301,7 @@ def train():
     parser.add_argument('--n_head', type=int, default=4)
     parser.add_argument('--n_layer', type=int, default=1)
     parser.add_argument('--batch_size', type=int, default=64)
-    parser.add_argument('--eval_every', type=int, default=0, help='evaluate every N steps (0 = end of training only)')
+    parser.add_argument('--eval_every', type=int, default=0, help='evaluate every N examples (0 = end of training only)')
     parser.add_argument('--lr', type=float, default=3e-4)
     parser.add_argument('--warmup', type=int, default=200)
     parser.add_argument('--max_len', type=int, default=320,
@@ -418,6 +418,8 @@ def train():
     writer = SummaryWriter(log_dir=f'runs/{name}')
     history = []
     global_step = 0
+    examples_processed = 0
+    next_eval_example = args.eval_every
 
     model.train()
     pbar = tqdm(train_loader, desc="Training")
@@ -438,8 +440,10 @@ def train():
         pbar.set_postfix(loss=f"{loss.item():.4f}", T=batch.size(1))
         writer.add_scalar('Loss/train', loss.item(), global_step)
         global_step += 1
+        examples_processed += batch.size(0)
 
-        if args.eval_every > 0 and global_step % args.eval_every == 0:
+        if args.eval_every > 0 and examples_processed >= next_eval_example:
+            next_eval_example += args.eval_every
             splits = {'id': evaluate(model, id_loader, vocab, device)}
             if ood_loader is not None:
                 splits['ood'] = evaluate(model, ood_loader, vocab, device)
