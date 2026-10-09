@@ -161,13 +161,53 @@ class RWKV7ChannelMix(nn.Module):
         return self.value(k)
 
 
+class RWKV7ChannelMixMoE(nn.Module):
+    def __init__(self, d_model, hidden_dim, num_experts=4):
+        super().__init__()
+        self.num_experts = num_experts
+        self.time_shift = nn.ZeroPad2d((0, 0, 1, -1))
+        
+        # Router for Top-1 using Gumbel-Softmax
+        self.router = nn.Linear(d_model, num_experts, bias=False)
+        
+        # Кожен експерт має свій індивідуальний вектор Token Shift
+        self.x_k = nn.Parameter(torch.empty(num_experts, 1, 1, d_model))
+        nn.init.constant_(self.x_k, 0.5)
+        
+        self.experts_key = nn.ModuleList([nn.Linear(d_model, hidden_dim, bias=False) for _ in range(num_experts)])
+        self.experts_value = nn.ModuleList([nn.Linear(hidden_dim, d_model, bias=False) for _ in range(num_experts)])
+
+    def forward(self, x):
+        logits = self.router(x)
+        if self.training:
+            routing_weights = F.gumbel_softmax(logits, tau=1.0, hard=True, dim=-1)
+        else:
+            indices = logits.argmax(dim=-1)
+            routing_weights = F.one_hot(indices, num_classes=self.num_experts).float()
+            
+        xx = self.time_shift(x) - x
+        
+        out = torch.zeros_like(x)
+        for i in range(self.num_experts):
+            weight = routing_weights[..., i:i+1]
+            k = x + xx * self.x_k[i]
+            k = torch.relu(self.experts_key[i](k)) ** 2
+            v = self.experts_value[i](k)
+            out = out + weight * v
+            
+        return out
+
+
 class RWKV7Block(nn.Module):
-    def __init__(self, d_model, n_head, lora_dim, dim_att=None, ffn_expand=4):
+    def __init__(self, d_model, n_head, lora_dim, dim_att=None, ffn_expand=4, moe_experts=0):
         super().__init__()
         self.ln_1 = nn.LayerNorm(d_model)
         self.tmix = RWKV7TimeMix(d_model, n_head, lora_dim, dim_att=dim_att)
         self.ln_2 = nn.LayerNorm(d_model)
-        self.ffn = RWKV7ChannelMix(d_model, d_model * ffn_expand)
+        if moe_experts > 0:
+            self.ffn = RWKV7ChannelMixMoE(d_model, d_model * ffn_expand, num_experts=moe_experts)
+        else:
+            self.ffn = RWKV7ChannelMix(d_model, d_model * ffn_expand)
 
     def forward(self, x):
         x = x + self.tmix(self.ln_1(x))
@@ -176,12 +216,12 @@ class RWKV7Block(nn.Module):
 
 
 class RWKV7Model(nn.Module):
-    def __init__(self, vocab_size, d_model=256, n_head=4, n_layer=1, lora_dim=32, dim_att=None, ffn_expand=4):
+    def __init__(self, vocab_size, d_model=256, n_head=4, n_layer=1, lora_dim=32, dim_att=None, ffn_expand=4, moe_experts=0):
         super().__init__()
         self.token_emb = nn.Embedding(vocab_size, d_model)
         self.ln_0 = nn.LayerNorm(d_model)
         self.blocks = nn.ModuleList(
-            [RWKV7Block(d_model, n_head, lora_dim, dim_att=dim_att, ffn_expand=ffn_expand) for _ in range(n_layer)]
+            [RWKV7Block(d_model, n_head, lora_dim, dim_att=dim_att, ffn_expand=ffn_expand, moe_experts=moe_experts) for _ in range(n_layer)]
         )
         self.ln_f = nn.LayerNorm(d_model)
         self.head = nn.Linear(d_model, vocab_size, bias=False)

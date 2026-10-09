@@ -272,7 +272,7 @@ def count_parameters(model):
 
 def train():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--model', type=str, required=True, choices=['transformer', 'rwkv', 'rwkv-2x', 'lstm'])
+    parser.add_argument('--model', type=str, required=True, choices=['transformer', 'rwkv', 'rwkv-2x', 'rwkv-x4', 'rwkv-moe', 'lstm'])
     parser.add_argument('--pos', type=str, default='learned', choices=['learned', 'rope'],
                         help='positional scheme of the transformer')
     parser.add_argument('--d_model', type=int, default=256)
@@ -333,6 +333,15 @@ def train():
         # 1 шар, але з подвійними параметрами (через dim_att та ffn_expand=12) і вдвічі більшою кількістю голів
         model = RWKV7Model(vocab.vocab_size, args.d_model, n_head=args.n_head * 2, n_layer=1, dim_att=args.d_model * 2, ffn_expand=12).to(device)
         name = f"rwkv-2x-L1-f{args.fillers}-s{args.seed}{args.tag}"
+    elif args.model == 'rwkv-x4':
+        # 1 шар, але з вчетверо більшими параметрами (через dim_att та ffn_expand=24) і вчетверо більшою кількістю голів
+        model = RWKV7Model(vocab.vocab_size, args.d_model, n_head=args.n_head * 4, n_layer=1, dim_att=args.d_model * 4, ffn_expand=24).to(device)
+        name = f"rwkv-x4-L1-f{args.fillers}-s{args.seed}{args.tag}"
+    elif args.model == 'rwkv-moe':
+        # 1 шар, спільний TimeMix (як у rwkv-x4), ChannelMix як MoE з 4 експертами по ~1M параметрів
+        # ffn_expand=8 дає hidden_dim=2048, кожен експерт: 2 * 256 * 2048 = 1,048,576 параметрів
+        model = RWKV7Model(vocab.vocab_size, args.d_model, n_head=args.n_head * 4, n_layer=1, dim_att=args.d_model * 4, ffn_expand=8, moe_experts=4).to(device)
+        name = f"rwkv-moe-L1-f{args.fillers}-s{args.seed}{args.tag}"
     elif args.model == 'lstm':
         from model_lstm import LSTMModel
         
