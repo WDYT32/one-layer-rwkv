@@ -272,7 +272,7 @@ def count_parameters(model):
 
 def train():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--model', type=str, required=True, choices=['transformer', 'rwkv', 'rwkv-2x'])
+    parser.add_argument('--model', type=str, required=True, choices=['transformer', 'rwkv', 'rwkv-2x', 'lstm'])
     parser.add_argument('--pos', type=str, default='learned', choices=['learned', 'rope'],
                         help='positional scheme of the transformer')
     parser.add_argument('--d_model', type=int, default=256)
@@ -333,6 +333,27 @@ def train():
         # 1 шар, але з подвійними параметрами (через dim_att та ffn_expand=12) і вдвічі більшою кількістю голів
         model = RWKV7Model(vocab.vocab_size, args.d_model, n_head=args.n_head * 2, n_layer=1, dim_att=args.d_model * 2, ffn_expand=12).to(device)
         name = f"rwkv-2x-L1-f{args.fillers}-s{args.seed}{args.tag}"
+    elif args.model == 'lstm':
+        from model_lstm import LSTMModel
+        
+        # Аналітичний підрахунок параметрів трансформера
+        d = args.d_model
+        v = vocab.vocab_size
+        pos_params = args.max_len * d if args.pos == 'learned' else 0
+        layer_params = 16 * d**2 + 4 * d
+        target_params = 2 * v * d + pos_params + args.n_layer * layer_params + 2 * d
+        
+        # Підбір hidden_size (H) для LSTM через квадратне рівняння:
+        # Params = V*d + 4*H*d + 4*H^2 + 8*H + 2*H + H*V
+        # 4*H^2 + (4*d + 10 + V)*H + (V*d - target_params) = 0
+        a = 4
+        b = 4 * d + 10 + v
+        c = v * d - target_params
+        
+        best_h = round((-b + math.sqrt(b**2 - 4 * a * c)) / (2 * a))
+                
+        model = LSTMModel(vocab.vocab_size, args.d_model, best_h, 1).to(device)
+        name = f"lstm-h{best_h}-L1-f{args.fillers}-s{args.seed}{args.tag}"
     else:
         model = RWKV7Model(vocab.vocab_size, args.d_model, args.n_head, args.n_layer).to(device)
         name = f"rwkv-channelmixing-L{args.n_layer}-f{args.fillers}-s{args.seed}{args.tag}"
