@@ -13,6 +13,7 @@ from torch.utils.data import Dataset, DataLoader, Sampler
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 
+import data_gen
 from model_transformer import BaselineTransformer
 from model_rwkv7 import RWKV7Model
 
@@ -60,23 +61,44 @@ def apply_fillers(text, mode):
     return " ".join(left + ['='] + right)
 
 
-class MathDataset(Dataset):
-    def __init__(self, filepath, vocab, max_len=320, fillers='both'):
-        self.items = []
-        with open(filepath) as f:
-            for line in f:
-                item = json.loads(line)
-                ids = vocab.encode(apply_fillers(item['text'], fillers))
-                if len(ids) > max_len:
-                    raise ValueError(f"sequence of {len(ids)} tokens exceeds max_len={max_len}; "
-                                     f"raise --max_len (and the model's context size, if it has one)")
-                self.items.append((ids, item['level']))
+class OnTheFlyItems:
+    def __init__(self, ds):
+        self.ds = ds
+    def __getitem__(self, slc):
+        if isinstance(slc, slice):
+            start = slc.start or 0
+            stop = slc.stop or len(self.ds)
+            return [self.ds[i] for i in range(start, stop)]
+        return self.ds[slc]
+
+
+class MathDatasetOnTheFly(Dataset):
+    def __init__(self, size, levels, vocab, max_len=320, fillers='both', max_abs=999, fmt='trace'):
+        self.size = size
+        self.levels = levels
+        self.vocab = vocab
+        self.max_len = max_len
+        self.fillers = fillers
+        self.max_abs = max_abs
+        self.fmt = fmt
 
     def __len__(self):
-        return len(self.items)
+        return self.size
+
+    @property
+    def items(self):
+        return OnTheFlyItems(self)
 
     def __getitem__(self, idx):
-        return self.items[idx]
+        while True:
+            level = random.choice(self.levels)
+            tree, expr_str, val = data_gen.generate_expression(level, random, self.max_abs, None)
+            steps = data_gen.solution_steps(tree)
+            ops = data_gen.solution_ops(tree)
+            text = data_gen.format_solution(steps, ops, self.fmt)
+            ids = self.vocab.encode(apply_fillers(text, self.fillers))
+            if len(ids) <= self.max_len:
+                return (ids, level)
 
 
 def make_collate(pad_id):
@@ -279,8 +301,7 @@ def train():
     parser.add_argument('--n_head', type=int, default=4)
     parser.add_argument('--n_layer', type=int, default=1)
     parser.add_argument('--batch_size', type=int, default=64)
-    parser.add_argument('--epochs', type=int, default=10)
-    parser.add_argument('--eval_every', type=int, default=0, help='evaluate every N steps (0 = end of epoch only)')
+    parser.add_argument('--eval_every', type=int, default=0, help='evaluate every N steps (0 = end of training only)')
     parser.add_argument('--lr', type=float, default=3e-4)
     parser.add_argument('--warmup', type=int, default=200)
     parser.add_argument('--max_len', type=int, default=320,
@@ -300,8 +321,15 @@ def train():
                              'the final answer (slow: O(T^2) model calls, no cache)')
     parser.add_argument('--gen_n', type=int, default=1000, help='samples per split for --gen_eval')
     parser.add_argument('--seed', type=int, default=0)
-    parser.add_argument('--data_dir', type=str, default='data')
-    parser.add_argument('--tag', type=str, default='')
+    
+    # On-the-fly generation args
+    parser.add_argument('--n_train', type=int, default=150000, help='Total number of training samples')
+    parser.add_argument('--n_test', type=int, default=3000, help='Number of test samples per split')
+    parser.add_argument('--max_ops', type=int, default=9, help='Largest number of operators for generation')
+    parser.add_argument('--train_max_ops', type=int, default=None, help='Train on 1..train_max_ops operators')
+    parser.add_argument('--max_abs', type=int, default=999, help='Bound on every intermediate value')
+    parser.add_argument('--format', type=str, default='trace', choices=['trace', 'hybrid', 'compact', 'hybrid_extended'], help='Solution format for generated data')
+    
     args = parser.parse_args()
 
     random.seed(args.seed)
@@ -313,36 +341,40 @@ def train():
     vocab = Vocab()
     collate = make_collate(vocab.pad_id)
 
-    train_ds = MathDataset(f'{args.data_dir}/train.jsonl', vocab, args.max_len, args.fillers)
-    test_id_ds = MathDataset(f'{args.data_dir}/test_id.jsonl', vocab, args.max_len, args.fillers)
     def make_loader(ds, shuffle):
         return DataLoader(ds, batch_size=args.batch_size, shuffle=shuffle, collate_fn=collate)
 
+    train_max = args.train_max_ops or args.max_ops
+    id_levels = list(range(1, train_max + 1))
+    train_ds = MathDatasetOnTheFly(args.n_train, id_levels, vocab, args.max_len, args.fillers, args.max_abs, args.format)
+    test_id_ds = MathDatasetOnTheFly(args.n_test, id_levels, vocab, args.max_len, args.fillers, args.max_abs, args.format)
     train_loader = make_loader(train_ds, True)
     id_loader = make_loader(test_id_ds, False)
-    ood_path = f'{args.data_dir}/test_ood.jsonl'
-    ood_loader, test_ood_ds = None, None  # exists only if train covers fewer operators than the generator's max
-    if os.path.exists(ood_path):
-        test_ood_ds = MathDataset(ood_path, vocab, args.max_len, args.fillers)
+    
+    if train_max < args.max_ops:
+        ood_levels = list(range(train_max + 1, args.max_ops + 1))
+        test_ood_ds = MathDatasetOnTheFly(args.n_test, ood_levels, vocab, args.max_len, args.fillers, args.max_abs, args.format)
         ood_loader = make_loader(test_ood_ds, False)
+    else:
+        ood_loader, test_ood_ds = None, None
 
     if args.model == 'transformer':
         model = BaselineTransformer(vocab.vocab_size, args.d_model, args.n_head,
                                     args.n_layer, pos=args.pos, max_len=args.max_len).to(device)
-        name = f"transformer-{args.pos}-L{args.n_layer}-f{args.fillers}-s{args.seed}{args.tag}"
+        name = f"transformer-{args.pos}-L{args.n_layer}-f{args.fillers}-s{args.seed}-{args.format}"
     elif args.model == 'rwkv-2x':
         # 1 шар, але з подвійними параметрами (через dim_att та ffn_expand=12) і вдвічі більшою кількістю голів
         model = RWKV7Model(vocab.vocab_size, args.d_model, n_head=args.n_head * 2, n_layer=1, dim_att=args.d_model * 2, ffn_expand=12).to(device)
-        name = f"rwkv-2x-L1-f{args.fillers}-s{args.seed}{args.tag}"
+        name = f"rwkv-2x-L1-f{args.fillers}-s{args.seed}-{args.format}"
     elif args.model == 'rwkv-x4':
         # 1 шар, але з вчетверо більшими параметрами (через dim_att та ffn_expand=24) і вчетверо більшою кількістю голів
         model = RWKV7Model(vocab.vocab_size, args.d_model, n_head=args.n_head * 4, n_layer=1, dim_att=args.d_model * 4, ffn_expand=24).to(device)
-        name = f"rwkv-x4-L1-f{args.fillers}-s{args.seed}{args.tag}"
+        name = f"rwkv-x4-L1-f{args.fillers}-s{args.seed}-{args.format}"
     elif args.model == 'rwkv-moe':
         # 1 шар, спільний TimeMix (як у rwkv-x4), ChannelMix як MoE з 4 експертами по ~1M параметрів
         # ffn_expand=8 дає hidden_dim=2048, кожен експерт: 2 * 256 * 2048 = 1,048,576 параметрів
         model = RWKV7Model(vocab.vocab_size, args.d_model, n_head=args.n_head * 4, n_layer=1, dim_att=args.d_model * 4, ffn_expand=8, moe_experts=4).to(device)
-        name = f"rwkv-moe-L1-f{args.fillers}-s{args.seed}{args.tag}"
+        name = f"rwkv-moe-L1-f{args.fillers}-s{args.seed}-{args.format}"
     elif args.model == 'lstm':
         from model_lstm import LSTMModel
         
@@ -363,17 +395,17 @@ def train():
         best_h = round((-b + math.sqrt(b**2 - 4 * a * c)) / (2 * a))
                 
         model = LSTMModel(vocab.vocab_size, args.d_model, best_h, 1).to(device)
-        name = f"lstm-h{best_h}-L1-f{args.fillers}-s{args.seed}{args.tag}"
+        name = f"lstm-h{best_h}-L1-f{args.fillers}-s{args.seed}-{args.format}"
     else:
         model = RWKV7Model(vocab.vocab_size, args.d_model, args.n_head, args.n_layer).to(device)
-        name = f"rwkv-channelmixing-L{args.n_layer}-f{args.fillers}-s{args.seed}{args.tag}"
+        name = f"rwkv-channelmixing-L{args.n_layer}-f{args.fillers}-s{args.seed}-{args.format}"
 
     n_params = count_parameters(model)
     print(f"Run: {name}\nParameters: {n_params:,}")
 
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=0.01)
-    total_steps = args.epochs * len(train_loader)
+    total_steps = len(train_loader)
 
     def lr_lambda(step):
         if step < args.warmup:
@@ -387,70 +419,73 @@ def train():
     history = []
     global_step = 0
 
-    for epoch in range(args.epochs):
-        model.train()
+    model.train()
+    pbar = tqdm(train_loader, desc="Training")
+    for batch, _ in pbar:
+        batch = batch.to(device)
+        inputs = batch[:, :-1]
+        targets, valid, post, answer = get_masks(batch, vocab)
+        mask = {'answer': answer, 'after_eq': post, 'all': valid}[args.loss_on]
 
-        pbar = tqdm(train_loader, desc=f"Epoch {epoch + 1}/{args.epochs}")
-        for batch, _ in pbar:
-            batch = batch.to(device)
-            inputs = batch[:, :-1]
-            targets, valid, post, answer = get_masks(batch, vocab)
-            mask = {'answer': answer, 'after_eq': post, 'all': valid}[args.loss_on]
+        optimizer.zero_grad()
+        logits = model(inputs)
+        loss, _ = masked_ce(logits, targets, mask, vocab.vocab_size)
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        optimizer.step()
+        scheduler.step()
 
-            optimizer.zero_grad()
-            logits = model(inputs)
-            loss, _ = masked_ce(logits, targets, mask, vocab.vocab_size)
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            optimizer.step()
-            scheduler.step()
+        pbar.set_postfix(loss=f"{loss.item():.4f}", T=batch.size(1))
+        writer.add_scalar('Loss/train', loss.item(), global_step)
+        global_step += 1
 
-            pbar.set_postfix(loss=f"{loss.item():.4f}", T=batch.size(1))
-            writer.add_scalar('Loss/train', loss.item(), global_step)
-            global_step += 1
+        if args.eval_every > 0 and global_step % args.eval_every == 0:
+            splits = {'id': evaluate(model, id_loader, vocab, device)}
+            if ood_loader is not None:
+                splits['ood'] = evaluate(model, ood_loader, vocab, device)
+            print(f"\n[Step {global_step}] Evaluation:")
+            for split, m in splits.items():
+                print(fmt(f'test_{split}', m))
+                writer.add_scalar(f'AnswerLoss/{split}', m['answer_loss'], global_step)
+                writer.add_scalar(f'AnswerTokenAcc/{split}', m['answer_token_acc'], global_step)
+                writer.add_scalar(f'EM/{split}', m['em'], global_step)
+                writer.add_scalar(f'StepAcc/{split}', m['step_acc'], global_step)
+                writer.add_scalar(f'FinalAnsAcc/{split}', m['final_ans_acc'], global_step)
+                for lvl, v in m['by_level'].items():
+                    writer.add_scalar(f'EM_ops_{lvl}', v['em'], global_step)
+                    writer.add_scalar(f'StepAcc_ops_{lvl}', v['step_acc'], global_step)
+                    writer.add_scalar(f'FinalAnsAcc_ops_{lvl}', v['final_ans_acc'], global_step)
+            step_entry = {'step': global_step, **{f'test_{k}': v for k, v in splits.items()}}
+            history.append(step_entry)
+            model.train()
 
-            if args.eval_every > 0 and global_step % args.eval_every == 0:
-                splits = {'id': evaluate(model, id_loader, vocab, device)}
-                if ood_loader is not None:
-                    splits['ood'] = evaluate(model, ood_loader, vocab, device)
-                print(f"\n[Step {global_step}] Evaluation:")
-                for split, m in splits.items():
-                    print(fmt(f'test_{split}', m))
-                    writer.add_scalar(f'AnswerLoss/{split}_step', m['answer_loss'], global_step)
-                    writer.add_scalar(f'AnswerTokenAcc/{split}_step', m['answer_token_acc'], global_step)
-                    writer.add_scalar(f'EM/{split}_step', m['em'], global_step)
-                    writer.add_scalar(f'StepAcc/{split}_step', m['step_acc'], global_step)
-                    writer.add_scalar(f'FinalAnsAcc/{split}_step', m['final_ans_acc'], global_step)
-                step_entry = {'step': global_step, 'epoch': epoch + 1, **{f'test_{k}': v for k, v in splits.items()}}
-                history.append(step_entry)
-                model.train()
+    # Final evaluation
+    splits = {'id': evaluate(model, id_loader, vocab, device)}
+    if ood_loader is not None:
+        splits['ood'] = evaluate(model, ood_loader, vocab, device)
+    print(f"\n[Final Step {global_step}] Evaluation:")
+    for split, m in splits.items():
+        print(fmt(f'test_{split}', m))
+        writer.add_scalar(f'AnswerLoss/{split}', m['answer_loss'], global_step)
+        writer.add_scalar(f'AnswerTokenAcc/{split}', m['answer_token_acc'], global_step)
+        writer.add_scalar(f'EM/{split}', m['em'], global_step)
+        writer.add_scalar(f'StepAcc/{split}', m['step_acc'], global_step)
+        writer.add_scalar(f'FinalAnsAcc/{split}', m['final_ans_acc'], global_step)
+        for lvl, v in m['by_level'].items():
+            writer.add_scalar(f'EM_ops_{lvl}', v['em'], global_step)
+            writer.add_scalar(f'StepAcc_ops_{lvl}', v['step_acc'], global_step)
+            writer.add_scalar(f'FinalAnsAcc_ops_{lvl}', v['final_ans_acc'], global_step)
+    entry = {'step': global_step, **{f'test_{k}': v for k, v in splits.items()}}
 
-        splits = {'id': evaluate(model, id_loader, vocab, device)}
-        if ood_loader is not None:
-            splits['ood'] = evaluate(model, ood_loader, vocab, device)
-        print(f"Epoch {epoch + 1}")
-        for split, m in splits.items():
-            print(fmt(f'test_{split}', m))
-            writer.add_scalar(f'AnswerLoss/{split}', m['answer_loss'], epoch)
-            writer.add_scalar(f'AnswerTokenAcc/{split}', m['answer_token_acc'], epoch)
-            writer.add_scalar(f'EM/{split}', m['em'], epoch)
-            writer.add_scalar(f'StepAcc/{split}', m['step_acc'], epoch)
-            writer.add_scalar(f'FinalAnsAcc/{split}', m['final_ans_acc'], epoch)
-            for lvl, v in m['by_level'].items():
-                writer.add_scalar(f'EM_ops_{lvl}', v['em'], epoch)
-                writer.add_scalar(f'StepAcc_ops_{lvl}', v['step_acc'], epoch)
-                writer.add_scalar(f'FinalAnsAcc_ops_{lvl}', v['final_ans_acc'], epoch)
-        entry = {'epoch': epoch + 1, **{f'test_{k}': v for k, v in splits.items()}}
-
-        if args.gen_eval and epoch + 1 == args.epochs:
-            gens = {'id': generate_eval(model, test_id_ds, vocab, device, args.max_len, args.gen_n)}
-            if test_ood_ds is not None:
-                gens['ood'] = generate_eval(model, test_ood_ds, vocab, device, args.max_len, args.gen_n)
-            for split, g in gens.items():
-                print(fmt_gen(f'test_{split}', g))
-                writer.add_scalar(f'FinalAnswerEM/{split}', g['final_em'], epoch)
-                entry[f'gen_{split}'] = g
-        history.append(entry)
+    if args.gen_eval:
+        gens = {'id': generate_eval(model, test_id_ds, vocab, device, args.max_len, args.gen_n)}
+        if test_ood_ds is not None:
+            gens['ood'] = generate_eval(model, test_ood_ds, vocab, device, args.max_len, args.gen_n)
+        for split, g in gens.items():
+            print(fmt_gen(f'test_{split}', g))
+            writer.add_scalar(f'FinalAnswerEM/{split}', g['final_em'], global_step)
+            entry[f'gen_{split}'] = g
+    history.append(entry)
 
     os.makedirs('results', exist_ok=True)
     with open(f'results/{name}.json', 'w') as f:
