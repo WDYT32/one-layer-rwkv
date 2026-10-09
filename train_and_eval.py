@@ -280,6 +280,7 @@ def train():
     parser.add_argument('--n_layer', type=int, default=1)
     parser.add_argument('--batch_size', type=int, default=64)
     parser.add_argument('--epochs', type=int, default=10)
+    parser.add_argument('--eval_every', type=int, default=0, help='evaluate every N steps (0 = end of epoch only)')
     parser.add_argument('--lr', type=float, default=3e-4)
     parser.add_argument('--warmup', type=int, default=200)
     parser.add_argument('--max_len', type=int, default=320,
@@ -408,6 +409,22 @@ def train():
             writer.add_scalar('Loss/train', loss.item(), global_step)
             global_step += 1
 
+            if args.eval_every > 0 and global_step % args.eval_every == 0:
+                splits = {'id': evaluate(model, id_loader, vocab, device)}
+                if ood_loader is not None:
+                    splits['ood'] = evaluate(model, ood_loader, vocab, device)
+                print(f"\n[Step {global_step}] Evaluation:")
+                for split, m in splits.items():
+                    print(fmt(f'test_{split}', m))
+                    writer.add_scalar(f'AnswerLoss/{split}_step', m['answer_loss'], global_step)
+                    writer.add_scalar(f'AnswerTokenAcc/{split}_step', m['answer_token_acc'], global_step)
+                    writer.add_scalar(f'EM/{split}_step', m['em'], global_step)
+                    writer.add_scalar(f'StepAcc/{split}_step', m['step_acc'], global_step)
+                    writer.add_scalar(f'FinalAnsAcc/{split}_step', m['final_ans_acc'], global_step)
+                step_entry = {'step': global_step, 'epoch': epoch + 1, **{f'test_{k}': v for k, v in splits.items()}}
+                history.append(step_entry)
+                model.train()
+
         splits = {'id': evaluate(model, id_loader, vocab, device)}
         if ood_loader is not None:
             splits['ood'] = evaluate(model, ood_loader, vocab, device)
@@ -439,6 +456,10 @@ def train():
     with open(f'results/{name}.json', 'w') as f:
         json.dump({'args': vars(args), 'params': n_params, 'history': history}, f, indent=2)
     print(f"Saved results/{name}.json")
+
+    ckpt_path = f'results/{name}.pt'
+    torch.save(model.state_dict(), ckpt_path)
+    print(f"Saved checkpoint to {ckpt_path}")
 
 
 if __name__ == "__main__":

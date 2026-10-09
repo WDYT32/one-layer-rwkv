@@ -223,7 +223,7 @@ if __name__ == "__main__":
                         help='train on 1..train_max_ops operators (default: max_ops). If smaller than '
                              'max_ops, test_ood.jsonl holds the longer expressions.')
     parser.add_argument('--max_abs', type=int, default=999, help='bound on every intermediate value')
-    parser.add_argument('--n_train', type=int, default=100000)
+    parser.add_argument('--n_train', type=int, default=1500000)
     parser.add_argument('--n_test', type=int, default=9000)
     parser.add_argument('--format', type=str, default='trace', choices=FORMATS,
                         help='solution layout, see format_solution(); use a separate --out_dir per format')
