@@ -288,6 +288,41 @@ def fmt_gen(name, g):
             f"(n={g['n']}) | {lv}")
 
 
+@torch.no_grad()
+def moe_stats(model, valid_in):
+    """Expert-usage stats of the last forward, over non-pad input positions only.
+    valid_in: (B, T) bool. Returns {} for non-MoE models."""
+    out = {}
+    for li, blk in enumerate(getattr(model, 'blocks', [])):
+        idx = getattr(blk.ffn, 'last_indices', None)
+        if idx is None:
+            continue
+        E = blk.ffn.num_experts
+        v = valid_in[:, :idx.size(1)]
+        frac = torch.bincount(idx[v], minlength=E).float() / v.sum().clamp(min=1)
+        same = (idx[:, 1:] == idx[:, :-1]) & v[:, 1:] & v[:, :-1]
+        pairs = (v[:, 1:] & v[:, :-1]).sum().clamp(min=1)
+        run = torch.ones(idx.size(0), dtype=torch.long, device=idx.device)
+        max_run = run.clone()
+        for t_ in range(1, idx.size(1)):
+            run = torch.where(same[:, t_ - 1], run + 1, torch.ones_like(run))
+            max_run = torch.maximum(max_run, run)
+        out[f'L{li}'] = {'usage': frac.tolist(),
+                         'entropy': float(-(frac * (frac + 1e-12).log()).sum() / math.log(E)),
+                         'repeat_rate': float(same.sum() / pairs),
+                         'max_run': int(max_run.max())}
+    return out
+
+
+def log_moe(writer, stats, step, prefix='MoE'):
+    for layer, s in stats.items():
+        for e, f in enumerate(s['usage']):
+            writer.add_scalar(f'{prefix}/{layer}/usage_e{e}', f, step)
+        writer.add_scalar(f'{prefix}/{layer}/entropy_norm', s['entropy'], step)
+        writer.add_scalar(f'{prefix}/{layer}/repeat_rate', s['repeat_rate'], step)
+        writer.add_scalar(f'{prefix}/{layer}/max_run', s['max_run'], step)
+
+
 def count_parameters(model):
     return sum(p.numel() for p in model.parameters() if p.requires_grad)
 
@@ -321,6 +356,12 @@ def train():
                              'the final answer (slow: O(T^2) model calls, no cache)')
     parser.add_argument('--gen_n', type=int, default=1000, help='samples per split for --gen_eval')
     parser.add_argument('--seed', type=int, default=0)
+    parser.add_argument('--moe_gamma', type=float, default=0.9, help='fatigue decay (rwkv-moe)')
+    parser.add_argument('--moe_kappa', type=float, default=0.2, help='fatigue increment per call; 0 = no-fatigue ablation')
+    parser.add_argument('--moe_theta', type=float, default=0.5, help='fatigue threshold for hard masking')
+    parser.add_argument('--moe_dense_ste', action='store_true',
+                        help='train all experts densely (gradient to every expert) instead of the sparse top-1 path')
+    parser.add_argument('--moe_log_every', type=int, default=50, help='log expert usage every N train steps')
     
     # On-the-fly generation args
     parser.add_argument('--n_train', type=int, default=150000, help='Total number of training samples')
@@ -378,8 +419,9 @@ def train():
     elif args.model == 'rwkv-moe':
         # 1 шар, спільний TimeMix (як у rwkv-x4), ChannelMix як MoE з 4 експертами по ~1M параметрів
         # ffn_expand=8 дає hidden_dim=2048, кожен експерт: 2 * 256 * 2048 = 1,048,576 параметрів
-        model = RWKV7Model(vocab.vocab_size, args.d_model, n_head=args.n_head * 4, n_layer=1, dim_att=args.d_model * 4, ffn_expand=8, moe_experts=4).to(device)
-        name = f"rwkv-moe-L1-f{args.fillers}-s{args.seed}-{args.format}"
+        model = RWKV7Model(vocab.vocab_size, args.d_model, n_head=args.n_head * 4, n_layer=1, dim_att=args.d_model * 4, ffn_expand=8, moe_experts=4,
+                           moe_kwargs=dict(gamma=args.moe_gamma, kappa=args.moe_kappa, theta=args.moe_theta, dense_ste=args.moe_dense_ste)).to(device)
+        name = f"rwkv-moe-k{args.moe_kappa:g}-g{args.moe_gamma:g}-t{args.moe_theta:g}-L1-f{args.fillers}-s{args.seed}-{args.format}"
     elif args.model == 'lstm':
         from model_lstm import LSTMModel
         
@@ -444,6 +486,8 @@ def train():
 
         pbar.set_postfix(loss=f"{loss.item():.4f}", T=batch.size(1))
         writer.add_scalar('Loss/train', loss.item(), global_step)
+        if args.model == 'rwkv-moe' and global_step % args.moe_log_every == 0:
+            log_moe(writer, moe_stats(model, inputs != vocab.pad_id), global_step)
         global_step += 1
         examples_processed += batch.size(0)
 
@@ -485,6 +529,22 @@ def train():
             writer.add_scalar(f'StepAcc_ops_{lvl}', v['step_acc'], global_step)
             writer.add_scalar(f'FinalAnsAcc_ops_{lvl}', v['final_ans_acc'], global_step)
     entry = {'step': global_step, **{f'test_{k}': v for k, v in splits.items()}}
+
+    if args.model == 'rwkv-moe':
+        model.eval()
+        with torch.no_grad():
+            for split, ld in [('id', id_loader), ('ood', ood_loader)]:
+                if ld is None:
+                    continue
+                b, _ = next(iter(ld))
+                b = b.to(device)
+                model(b[:, :-1])
+                st = moe_stats(model, b[:, :-1] != vocab.pad_id)
+                log_moe(writer, st, global_step, prefix=f'MoE_eval_{split}')
+                entry[f'moe_{split}'] = st
+                for layer, s in st.items():
+                    print(f"  moe[{split}] {layer} usage={[round(u, 3) for u in s['usage']]} "
+                          f"entropy={s['entropy']:.3f} repeat={s['repeat_rate']:.3f} max_run={s['max_run']}")
 
     if args.gen_eval:
         gens = {'id': generate_eval(model, test_id_ds, vocab, device, args.max_len, args.gen_n)}

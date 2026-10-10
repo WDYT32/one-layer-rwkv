@@ -1,3 +1,5 @@
+import math
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -162,50 +164,106 @@ class RWKV7ChannelMix(nn.Module):
 
 
 class RWKV7ChannelMixMoE(nn.Module):
-    def __init__(self, d_model, hidden_dim, num_experts=4):
+    """Top-1 MoE ChannelMix with fatigue (refractory) hard masking.
+
+    Routing: deterministic argmax over fatigue-masked router logits (no Gumbel noise);
+    exploration comes only from fatigue. The fatigue recurrence is sequential in t
+    (choice at t depends on choices before it), so it is one cheap loop over T on
+    (B, E) tensors; everything heavy is loop-free.
+
+    Compute: only the selected expert runs for each token. Tokens are sorted by expert,
+    packed into an (E, cap, D) buffer and processed with two bmm calls
+    (cap = largest group, so padding waste is small when routing is balanced).
+
+    Gradient (train): out *= 1 + p_sel - p_sel.detach()  (forward factor is exactly 1,
+    so train == eval). The router learns through the selected expert's probability;
+    unselected experts get no gradient at that token and are reached via fatigue.
+    dense_ste=True restores the dense variant where every expert gets a gradient.
+    Fatigue is causal and restarts at every forward, so right-padding cannot affect real tokens.
+    """
+
+    def __init__(self, d_model, hidden_dim, num_experts=4, gamma=0.9, kappa=0.2, theta=0.5, dense_ste=False):
         super().__init__()
         self.num_experts = num_experts
+        self.gamma, self.kappa, self.theta = gamma, kappa, theta
+        self.dense_ste = dense_ste
         self.time_shift = nn.ZeroPad2d((0, 0, 1, -1))
-        
-        # Router for Top-1 using Gumbel-Softmax
+
         self.router = nn.Linear(d_model, num_experts, bias=False)
-        
-        # Кожен експерт має свій індивідуальний вектор Token Shift
-        self.x_k = nn.Parameter(torch.empty(num_experts, 1, 1, d_model))
-        nn.init.constant_(self.x_k, 0.5)
-        
-        self.experts_key = nn.ModuleList([nn.Linear(d_model, hidden_dim, bias=False) for _ in range(num_experts)])
-        self.experts_value = nn.ModuleList([nn.Linear(hidden_dim, d_model, bias=False) for _ in range(num_experts)])
+        # per-expert token-shift vector and stacked FFN weights (nn.Linear-style init)
+        self.x_k = nn.Parameter(torch.full((num_experts, d_model), 0.5))
+        self.w_key = nn.Parameter(torch.empty(num_experts, d_model, hidden_dim))
+        self.w_value = nn.Parameter(torch.empty(num_experts, hidden_dim, d_model))
+        nn.init.uniform_(self.w_key, -1 / math.sqrt(d_model), 1 / math.sqrt(d_model))
+        nn.init.uniform_(self.w_value, -1 / math.sqrt(hidden_dim), 1 / math.sqrt(hidden_dim))
+
+        self.last_indices = None  # (B, T) chosen expert per token, for logging
+
+    @torch.no_grad()
+    def _route(self, logits_all):
+        B, T, E = logits_all.shape
+        lg = logits_all.detach().float()
+        F_e = lg.new_zeros(B, E)  # fp32 even under autocast
+        inc = lg.new_full((B, 1), self.kappa)
+        masks = torch.empty(T, B, E, dtype=torch.bool, device=lg.device)
+        idxs = torch.empty(T, B, dtype=torch.long, device=lg.device)
+        for t in range(T):
+            mask = F_e > self.theta
+            mask = mask & ~mask.all(dim=-1, keepdim=True)  # all fatigued -> unmask all (no NaN)
+            idx = lg[:, t].masked_fill(mask, float('-inf')).argmax(dim=-1)
+            F_e = (F_e * self.gamma).scatter_add_(1, idx.unsqueeze(1), inc)
+            masks[t] = mask
+            idxs[t] = idx
+        return masks.transpose(0, 1), idxs.transpose(0, 1)
+
+    def _grouped_ffn(self, xin, idx):
+        """xin (N, D), idx (N,) -> (N, D); each row goes through its own expert only."""
+        E, N = self.num_experts, idx.numel()
+        order = idx.argsort(stable=True)
+        sidx = idx[order]
+        counts = torch.bincount(idx, minlength=E)
+        pos = torch.arange(N, device=idx.device) - (counts.cumsum(0) - counts)[sidx]
+        cap = int(counts.max())
+        buf = xin.new_zeros(E, cap, xin.size(-1))
+        buf[sidx, pos] = xin[order]
+        h = torch.relu(torch.bmm(buf, self.w_key)) ** 2
+        o = torch.bmm(h, self.w_value)
+        return o[sidx, pos][order.argsort()]
 
     def forward(self, x):
-        logits = self.router(x)
-        if self.training:
-            routing_weights = F.gumbel_softmax(logits, tau=1.0, hard=True, dim=-1)
-        else:
-            indices = logits.argmax(dim=-1)
-            routing_weights = F.one_hot(indices, num_classes=self.num_experts).float()
-            
+        B, T, C = x.shape
+        logits_all = self.router(x)
+        mask_all, indices = self._route(logits_all)
+        self.last_indices = indices
         xx = self.time_shift(x) - x
-        
-        out = torch.zeros_like(x)
-        for i in range(self.num_experts):
-            weight = routing_weights[..., i:i+1]
-            k = x + xx * self.x_k[i]
-            k = torch.relu(self.experts_key[i](k)) ** 2
-            v = self.experts_value[i](k)
-            out = out + weight * v
-            
+
+        if self.training and self.dense_ste:
+            probs = F.softmax(logits_all.float().masked_fill(mask_all, float('-inf')), dim=-1).to(x.dtype)
+            hard = F.one_hot(indices, self.num_experts).to(x.dtype)
+            w = hard + probs - probs.detach()
+            xin = x.unsqueeze(0) + xx.unsqueeze(0) * self.x_k[:, None, None, :]
+            h = torch.relu(torch.einsum('ebtd,edh->ebth', xin, self.w_key)) ** 2
+            v = torch.einsum('ebth,ehd->ebtd', h, self.w_value)
+            return torch.einsum('ebtd,bte->btd', v, w)
+
+        idxf = indices.reshape(-1)
+        xin = x.reshape(-1, C) + xx.reshape(-1, C) * self.x_k[idxf]
+        out = self._grouped_ffn(xin, idxf).view(B, T, C)
+        if self.training:
+            probs = F.softmax(logits_all.float().masked_fill(mask_all, float('-inf')), dim=-1)
+            p_sel = probs.gather(-1, indices.unsqueeze(-1))
+            out = out * (1 + p_sel - p_sel.detach()).to(out.dtype)
         return out
 
 
 class RWKV7Block(nn.Module):
-    def __init__(self, d_model, n_head, lora_dim, dim_att=None, ffn_expand=4, moe_experts=0):
+    def __init__(self, d_model, n_head, lora_dim, dim_att=None, ffn_expand=4, moe_experts=0, moe_kwargs=None):
         super().__init__()
         self.ln_1 = nn.LayerNorm(d_model)
         self.tmix = RWKV7TimeMix(d_model, n_head, lora_dim, dim_att=dim_att)
         self.ln_2 = nn.LayerNorm(d_model)
         if moe_experts > 0:
-            self.ffn = RWKV7ChannelMixMoE(d_model, d_model * ffn_expand, num_experts=moe_experts)
+            self.ffn = RWKV7ChannelMixMoE(d_model, d_model * ffn_expand, num_experts=moe_experts, **(moe_kwargs or {}))
         else:
             self.ffn = RWKV7ChannelMix(d_model, d_model * ffn_expand)
 
@@ -216,12 +274,12 @@ class RWKV7Block(nn.Module):
 
 
 class RWKV7Model(nn.Module):
-    def __init__(self, vocab_size, d_model=256, n_head=4, n_layer=1, lora_dim=32, dim_att=None, ffn_expand=4, moe_experts=0):
+    def __init__(self, vocab_size, d_model=256, n_head=4, n_layer=1, lora_dim=32, dim_att=None, ffn_expand=4, moe_experts=0, moe_kwargs=None):
         super().__init__()
         self.token_emb = nn.Embedding(vocab_size, d_model)
         self.ln_0 = nn.LayerNorm(d_model)
         self.blocks = nn.ModuleList(
-            [RWKV7Block(d_model, n_head, lora_dim, dim_att=dim_att, ffn_expand=ffn_expand, moe_experts=moe_experts) for _ in range(n_layer)]
+            [RWKV7Block(d_model, n_head, lora_dim, dim_att=dim_att, ffn_expand=ffn_expand, moe_experts=moe_experts, moe_kwargs=moe_kwargs) for _ in range(n_layer)]
         )
         self.ln_f = nn.LayerNorm(d_model)
         self.head = nn.Linear(d_model, vocab_size, bias=False)
